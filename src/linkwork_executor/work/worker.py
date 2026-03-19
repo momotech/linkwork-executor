@@ -1224,6 +1224,7 @@ class Worker:
             cwd=engine_cwd,
             redis_client=self._redis_client,
             runtime_system_prompt_append=task.system_prompt_append,
+            runtime_model_override=task.selected_model,
         ) as engine:
             stream = engine.run(task.content).__aiter__()
             while True:

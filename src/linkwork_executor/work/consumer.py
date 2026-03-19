@@ -36,6 +36,7 @@ class Task:
     content: str
     system_prompt_append: str
     delivery_mode: str
+    selected_model: str = ""
     role_id: str = ""
     git_config: list[GitRepoConfig] = field(default_factory=list)
     file_path_mappings: list["FilePathMapping"] = field(default_factory=list)
@@ -94,6 +95,9 @@ class TaskConsumer:
             user_id = str(raw_task["user_id"]).strip()
             content = str(raw_task["content"]).strip()
             system_prompt_append = str(raw_task["system_prompt_append"]).strip()
+            selected_model = str(
+                raw_task.get("selected_model", raw_task.get("selectedModel", ""))
+            ).strip()
 
             if not task_id:
                 raise ValueError("task_id cannot be empty")
@@ -101,6 +105,8 @@ class TaskConsumer:
                 raise ValueError("user_id cannot be empty")
             if not content:
                 raise ValueError("content cannot be empty")
+            if not selected_model:
+                raise ValueError("selected_model cannot be empty")
             if not system_prompt_append:
                 raise ValueError("system_prompt_append cannot be empty")
 
@@ -110,6 +116,7 @@ class TaskConsumer:
                 content=content,
                 system_prompt_append=system_prompt_append,
                 delivery_mode=delivery_mode,
+                selected_model=selected_model,
                 role_id=str(raw_task.get("role_id", "")).strip(),
                 git_config=git_config,
                 file_path_mappings=file_path_mappings,

@@ -1216,6 +1216,7 @@ class Worker:
 
     async def _run_task_once(self, task: Task, task_workspace: Path) -> None:
         engine_cwd = self._resolve_engine_cwd(task, task_workspace)
+        runtime_model_override = self._resolve_runtime_model(task)
 
         async with AgentEngine(
             config_file=self._config_file,
@@ -1224,7 +1225,7 @@ class Worker:
             cwd=engine_cwd,
             redis_client=self._redis_client,
             runtime_system_prompt_append=task.system_prompt_append,
-            runtime_model_override=task.selected_model,
+            runtime_model_override=runtime_model_override,
         ) as engine:
             stream = engine.run(task.content).__aiter__()
             while True:
@@ -1241,6 +1242,33 @@ class Worker:
                         f"{task.task_id} runtime stream idle timeout after "
                         f"{self._task_runtime_idle_timeout}s"
                     ) from error
+
+    def _resolve_runtime_model(self, task: Task) -> str | None:
+        selected = (task.selected_model or "").strip()
+        if selected:
+            lowered = selected.lower()
+            if "claude" in lowered:
+                return selected
+
+            fallback = os.getenv("ANTHROPIC_MODEL", "").strip()
+            if fallback:
+                _logger.info(
+                    "task %s selected_model=%s is not claude-compatible, fallback runtime model=%s",
+                    task.task_id,
+                    selected,
+                    fallback,
+                )
+                return fallback
+
+            _logger.info(
+                "task %s selected_model=%s is not claude-compatible, fallback to config default",
+                task.task_id,
+                selected,
+            )
+            return None
+
+        fallback = os.getenv("ANTHROPIC_MODEL", "").strip()
+        return fallback or None
 
     def _is_git_delivery(self, task: Task) -> bool:
         return task.delivery_mode == DELIVERY_MODE_GIT

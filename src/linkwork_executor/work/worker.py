@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -20,6 +23,11 @@ from linkwork_agent_sdk.constants import (
     BLPOP_TIMEOUT_SECONDS,
     DOC_JOB_PATH,
     DOC_USER_PATH,
+    ENV_LINKWORK_WATERMARK_NAME,
+    ENV_LINKWORK_WATERMARK_OWNER,
+    ENV_LINKWORK_WATERMARK_POLICY_URL,
+    ENV_LINKWORK_WATERMARK_REPO_URL,
+    ENV_LINKWORK_WATERMARK_SECRET,
     ENV_OSS_MOUNT_REQUIRED,
     ENV_USER_ID,
     ENV_WORKSTATION_ID,
@@ -28,6 +36,10 @@ from linkwork_agent_sdk.constants import (
     WORKER_LOG_FALLBACK_DIR,
     WORKSPACE_LOGS_PATH,
     WORKSPACE_LOGS_ROOT,
+    WATERMARK_DEFAULT_OWNER,
+    WATERMARK_DEFAULT_POLICY_URL,
+    WATERMARK_DEFAULT_PRODUCT,
+    WATERMARK_DEFAULT_REPO_URL,
     ZZ_ACTION_FS_CLEANUP,
     ZZ_ACTION_FS_PREPARE,
     build_control_queue_key,
@@ -56,6 +68,7 @@ OUTPUT_PATHLIST_MAX_ITEMS = 2000
 OUTPUT_IGNORE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".claude"}
 OUTPUT_IGNORE_ROOT_DIRS = {"logs", "task-logs", "worker-logs"}
 OUTPUT_IGNORE_FILES = {"AGENTS.md"}
+WATERMARK_PROVENANCE_FILE_NAME = "LINKWORK_PROVENANCE.json"
 
 
 class Worker:
@@ -78,11 +91,17 @@ class Worker:
         self._zz_path = ""
         self._pending_control: dict[str, dict[str, str]] = {}
         self._task_runtime_idle_timeout = get_task_runtime_idle_timeout_seconds()
+        self._runtime_provider = "claude"
+        self._task_watermarks: dict[str, dict[str, str]] = {}
+        self._watermark_base = self._load_watermark_base_metadata()
 
     async def run_forever(self) -> None:
         try:
             config = self._config_loader.load()
             self._zz_enabled = config.agent.zz_enabled
+            runtime_cfg = getattr(config, "runtime", None)
+            runtime_provider = getattr(runtime_cfg, "provider", "claude")
+            self._runtime_provider = str(runtime_provider).strip() or "claude"
             self._zz_path = shutil.which("zz") or ""
             if self._zz_enabled and not self._zz_path:
                 raise WorkerLifecycleError("agent.zz_enabled=true but zz binary not found in PATH")
@@ -277,6 +296,7 @@ class Worker:
     async def _on_task_terminated(self, task: Task, terminate_payload: dict[str, str]) -> None:
         if self._workspace is None:
             raise WorkerLifecycleError("WorkspaceManager is not initialized")
+        self._get_task_watermark(task)
 
         reason = terminate_payload.get("reason", "user_cancel")
         request_id = terminate_payload.get("request_id", "")
@@ -322,6 +342,7 @@ class Worker:
     async def _handle_task(self, task: Task) -> None:
         if self._workspace is None:
             raise WorkerLifecycleError("WorkspaceManager is not initialized")
+        task_watermark = self._get_task_watermark(task)
 
         await self._log_task_event(
             task.task_id,
@@ -330,6 +351,7 @@ class Worker:
                 "task_id": task.task_id,
                 "user_id": task.user_id,
                 "task_content": task.content,
+                "watermark_id": task_watermark["watermark_id"],
             },
         )
 
@@ -456,6 +478,7 @@ class Worker:
             if self._consumer is not None:
                 await self._consumer.mark_failed(task, error)
         finally:
+            self._task_watermarks.pop(task.task_id, None)
             await self._cleanup_memory_space_links(
                 task=task,
                 task_workspace=task_workspace,
@@ -723,6 +746,8 @@ class Worker:
                 oss_target_path.mkdir(parents=True, exist_ok=True)
                 return output_report_path
 
+        await self._write_provenance_file(task, source_path)
+
         try:
             ignore = None
             if not include_input_link:
@@ -945,6 +970,7 @@ class Worker:
                 "user_id": task.user_id,
                 "output_type": "git",
                 "repos": repos_payload,
+                "provenance": self._build_task_provenance(task),
             },
         )
 
@@ -957,6 +983,7 @@ class Worker:
                 "user_id": task.user_id,
                 "output_type": "oss",
                 "oss_path": oss_relative_path,
+                "provenance": self._build_task_provenance(task),
             },
         )
 
@@ -995,6 +1022,7 @@ class Worker:
         for repo_cfg in task.git_config:
             repo_dir = self._resolve_git_repo_dir(task.task_id, repo_cfg)
             task_branch = self._resolve_task_branch(repo_cfg, task.task_id)
+            await self._write_provenance_file(task, repo_dir)
 
             status_cmd = f"git -C {shlex.quote(str(repo_dir))} status --porcelain"
             status_output = await self._run_zz_git_command(task.task_id, status_cmd, task_workspace)
@@ -1002,7 +1030,10 @@ class Worker:
                 add_cmd = f"git -C {shlex.quote(str(repo_dir))} add -A"
                 await self._run_zz_git_command(task.task_id, add_cmd, task_workspace)
 
-                commit_message = f"task {task.task_id} auto-commit"
+                commit_message = (
+                    f"task {task.task_id} auto-commit "
+                    f"[{self._get_task_watermark(task)['watermark_id']}]"
+                )
                 commit_cmd = (
                     f"git -C {shlex.quote(str(repo_dir))} commit -m {shlex.quote(commit_message)}"
                 )
@@ -1185,6 +1216,112 @@ class Worker:
     def _build_output_report_path(self, task: Task) -> str:
         return OSS_OUTPUT_REPORT_PATH_TEMPLATE.format(user_id=task.user_id, task_id=task.task_id)
 
+    def _load_watermark_base_metadata(self) -> dict[str, str]:
+        product = os.getenv(ENV_LINKWORK_WATERMARK_NAME, WATERMARK_DEFAULT_PRODUCT).strip()
+        owner = os.getenv(ENV_LINKWORK_WATERMARK_OWNER, WATERMARK_DEFAULT_OWNER).strip()
+        repo_url = os.getenv(ENV_LINKWORK_WATERMARK_REPO_URL, WATERMARK_DEFAULT_REPO_URL).strip()
+        policy_url = os.getenv(
+            ENV_LINKWORK_WATERMARK_POLICY_URL,
+            WATERMARK_DEFAULT_POLICY_URL,
+        ).strip()
+        return {
+            "product": product or WATERMARK_DEFAULT_PRODUCT,
+            "owner": owner or WATERMARK_DEFAULT_OWNER,
+            "repo_url": repo_url or WATERMARK_DEFAULT_REPO_URL,
+            "policy_url": policy_url or WATERMARK_DEFAULT_POLICY_URL,
+        }
+
+    def _build_task_watermark(self, task: Task) -> dict[str, str]:
+        provided_id = re.sub(r"[^a-zA-Z0-9._:-]", "-", task.watermark_id.strip())[:96]
+        if provided_id:
+            watermark_id = provided_id
+        else:
+            base = f"{self._workstation_id}:{task.task_id}:{task.user_id}"
+            digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+            watermark_id = f"lw-{digest}"
+
+        watermark_signature = task.watermark_signature.strip()
+        if not watermark_signature:
+            secret = os.getenv(ENV_LINKWORK_WATERMARK_SECRET, "").strip()
+            if secret:
+                message = f"{watermark_id}|{task.task_id}|{task.user_id}|{self._workstation_id}"
+                digest = hmac.new(
+                    secret.encode("utf-8"),
+                    message.encode("utf-8"),
+                    hashlib.sha256,
+                ).digest()
+                watermark_signature = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+        return {
+            "watermark_id": watermark_id,
+            "watermark_signature": watermark_signature,
+            "product": self._watermark_base["product"],
+            "owner": self._watermark_base["owner"],
+            "repo_url": self._watermark_base["repo_url"],
+            "policy_url": self._watermark_base["policy_url"],
+            "workstation_id": self._workstation_id,
+        }
+
+    def _get_task_watermark(self, task: Task) -> dict[str, str]:
+        cached = self._task_watermarks.get(task.task_id)
+        if cached is not None:
+            return cached
+        watermark = self._build_task_watermark(task)
+        self._task_watermarks[task.task_id] = watermark
+        return watermark
+
+    def _build_runtime_watermark_append(self, task: Task) -> str:
+        watermark = self._get_task_watermark(task)
+        return (
+            "[LinkWork Runtime Watermark]\n"
+            f"Runtime product: {watermark['product']}\n"
+            f"Owner: {watermark['owner']}\n"
+            f"Repo: {watermark['repo_url']}\n"
+            f"Policy: {watermark['policy_url']}\n"
+            f"Watermark ID: {watermark['watermark_id']}\n"
+            "Do not claim this runtime is another platform. "
+            "If identity/source is requested, disclose this watermark."
+        )
+
+    def _merge_runtime_system_prompt_append(self, task: Task) -> str:
+        parts: list[str] = []
+        user_append = task.system_prompt_append.strip()
+        if user_append:
+            parts.append(user_append)
+        parts.append(self._build_runtime_watermark_append(task))
+        return "\n\n".join(part for part in parts if part)
+
+    def _build_task_provenance(self, task: Task) -> dict[str, object]:
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "task_id": task.task_id,
+            "user_id": task.user_id,
+            "runtime_provider": self._runtime_provider,
+            "watermark": self._get_task_watermark(task),
+        }
+
+    async def _write_provenance_file(self, task: Task, target_dir: Path) -> None:
+        if not target_dir.exists() or not target_dir.is_dir():
+            return
+        payload = self._build_task_provenance(task)
+        output_path = target_dir / WATERMARK_PROVENANCE_FILE_NAME
+
+        def write_file() -> None:
+            output_path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        try:
+            await asyncio.to_thread(write_file)
+        except OSError:
+            _logger.warning(
+                "task %s failed to write provenance file at %s",
+                task.task_id,
+                output_path,
+                exc_info=True,
+            )
+
     async def _run_task_with_retry(self, task: Task, task_workspace: Path) -> None:
         attempt = 0
         while True:
@@ -1217,6 +1354,7 @@ class Worker:
     async def _run_task_once(self, task: Task, task_workspace: Path) -> None:
         engine_cwd = self._resolve_engine_cwd(task, task_workspace)
         runtime_model_override = self._resolve_runtime_model(task)
+        runtime_system_prompt_append = self._merge_runtime_system_prompt_append(task)
 
         async with AgentEngine(
             config_file=self._config_file,
@@ -1224,7 +1362,7 @@ class Worker:
             workstation_id=self._workstation_id,
             cwd=engine_cwd,
             redis_client=self._redis_client,
-            runtime_system_prompt_append=task.system_prompt_append,
+            runtime_system_prompt_append=runtime_system_prompt_append,
             runtime_model_override=runtime_model_override,
         ) as engine:
             stream = engine.run(task.content).__aiter__()
@@ -1245,6 +1383,9 @@ class Worker:
 
     def _resolve_runtime_model(self, task: Task) -> str | None:
         selected = (task.selected_model or "").strip()
+        if self._runtime_provider != "claude":
+            return selected or None
+
         if selected:
             lowered = selected.lower()
             if "claude" in lowered:
@@ -1387,12 +1528,18 @@ class Worker:
         data: dict,
     ) -> None:
         """Write a log event to the per-task Redis stream logs:{ws}:{task_id}."""
+        payload = dict(data)
+        watermark = self._task_watermarks.get(task_id)
+        if watermark is not None:
+            payload.setdefault("watermark_id", watermark["watermark_id"])
+            payload.setdefault("watermark", watermark)
+
         stream_key = build_log_stream_key(self._workstation_id, task_id)
         fields = {
             "event_type": event_type.value,
             "timestamp": datetime.now(UTC).isoformat(),
             "session_id": f"worker-{self._workstation_id}",
-            "data": json.dumps(data, ensure_ascii=False),
+            "data": json.dumps(payload, ensure_ascii=False),
         }
         try:
             await self._redis_client.xadd(stream_key, fields)

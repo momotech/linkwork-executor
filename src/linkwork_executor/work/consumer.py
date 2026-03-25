@@ -36,6 +36,8 @@ class Task:
     content: str
     system_prompt_append: str
     delivery_mode: str
+    watermark_id: str = ""
+    watermark_signature: str = ""
     selected_model: str = ""
     role_id: str = ""
     git_config: list[GitRepoConfig] = field(default_factory=list)
@@ -111,6 +113,8 @@ class TaskConsumer:
                 content=content,
                 system_prompt_append=system_prompt_append,
                 delivery_mode=delivery_mode,
+                watermark_id=str(raw_task.get("watermark_id", "")).strip(),
+                watermark_signature=str(raw_task.get("watermark_signature", "")).strip(),
                 selected_model=str(raw_task.get("selected_model", "")).strip(),
                 role_id=str(raw_task.get("role_id", "")).strip(),
                 git_config=git_config,

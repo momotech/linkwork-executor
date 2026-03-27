@@ -49,7 +49,7 @@ Common env vars:
 
 ### Option A: Run inside role image (primary path)
 
-In `LinkWork/back`, build flow copies `linkwork-executor` source into role images. Runtime is started through:
+In `LinkWork/backend`, build flow copies `linkwork-executor` source into role images. Runtime is started through:
 
 - `start-single.sh` (single-container mode)
 - `start-dual.sh` (agent + runner mode)
@@ -67,5 +67,5 @@ python -m build
 ## Related Components
 
 - Depends on `linkwork-agent-sdk`
-- Upstream scheduler: `LinkWork/back`
+- Upstream scheduler: `LinkWork/backend`
 - Data channel: Redis queue + Redis stream

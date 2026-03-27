@@ -47,7 +47,7 @@ linkwork-executor-worker --config ./config.json
 
 ### 方案 A：随角色镜像运行（主路径）
 
-`LinkWork/back` 构建阶段会把 `linkwork-executor` 源码复制到镜像中；运行阶段由以下脚本拉起：
+`LinkWork/backend` 构建阶段会把 `linkwork-executor` 源码复制到镜像中；运行阶段由以下脚本拉起：
 
 - 单容器：`start-single.sh`
 - 双容器（Agent + Runner）：`start-dual.sh`
@@ -65,5 +65,5 @@ python -m build
 ## 与其他模块关系
 
 - 依赖：`linkwork-agent-sdk`
-- 上游调度：`LinkWork/back`（任务下发与状态管理）
+- 上游调度：`LinkWork/backend`（任务下发与状态管理）
 - 数据通道：Redis 队列 + Redis Stream
